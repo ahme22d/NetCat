@@ -262,7 +262,3 @@ Runs built-in checks for:
 This project is built for **educational purposes** and authorized lab environments only. Only run it on systems and networks you own or have explicit permission to test. The author is not responsible for misuse.
 
 ---
-
-## License
-
-Add a `LICENSE` file of your choice (e.g. MIT) before publishing.

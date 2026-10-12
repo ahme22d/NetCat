@@ -71,8 +71,8 @@ An educational, multi-client **TCP client/server tool** written in pure Python (
 ## Installation
 
 ```bash
-git clone https://github.com/<your-username>/<your-repo>.git
-cd <your-repo>
+git clone https://github.com/ahme22d/NetCat.git
+cd NetCat
 python3 netcat.py --help
 ```
 

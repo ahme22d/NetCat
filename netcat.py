@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import queue
 try:
     import readline
 except ImportError:
@@ -21,10 +22,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime
 
+from quic_transport import (
+    QuicClientConnection,
+    QuicServer,
+    create_client_configuration,
+    create_server_configuration,
+)
 
 # ============================================================
 # NetCat V3
-# Educational TCP Client / Server
+# Educational TCP / QUIC Client / Server
 # ============================================================
 
 VERSION = "3.0.0"
@@ -209,6 +216,10 @@ class ClientInfo:
         default_factory=threading.Lock
     )
 
+    write_lock: threading.RLock = field(
+        default_factory=threading.RLock
+    )
+
     rate_lock: threading.Lock = field(
         default_factory=threading.Lock
     )
@@ -218,6 +229,10 @@ class ClientInfo:
     )
 
     rate_bytes: int = 0
+
+    transfer_active: threading.Event = field(
+        default_factory=threading.Event
+    )
 
 
 # ============================================================
@@ -485,13 +500,15 @@ class NetCatServer:
         data
     ):
 
-        with client.send_lock:
+        with client.write_lock:
 
-            send_frame(
-                client.sock,
-                data,
-                self.max_size
-            )
+            with client.send_lock:
+
+                send_frame(
+                    client.sock,
+                    data,
+                    self.max_size
+                )
 
     # ========================================================
     # Broadcast
@@ -964,6 +981,18 @@ class NetCatServer:
         client,
         filename
     ):
+        client.transfer_active.set()
+        try:
+            with client.write_lock:
+                self._send_file(client, filename)
+        finally:
+            client.transfer_active.clear()
+
+    def _send_file(
+        self,
+        client,
+        filename
+    ):
 
         filename = safe_filename(
             filename
@@ -1187,7 +1216,7 @@ exit
                             f"{self.host}:{self.port}",
 
                         "tls":
-                            self.tls
+                            self.tls or self.args.udp
                     }
                 }
             )
@@ -1224,7 +1253,7 @@ exit
                             uptime,
 
                         "tls":
-                            self.tls,
+                            self.tls or self.args.udp,
 
                         "authentication":
                             self.auth_enabled
@@ -1357,7 +1386,7 @@ exit
                         now(),
 
                     "tls":
-                        self.tls
+                        self.tls or self.args.udp
                 }
             )
 
@@ -1384,7 +1413,10 @@ exit
             while self.running:
 
                 client.sock.settimeout(
-                    self.timeout
+                    max(
+                        self.timeout,
+                        self.args.heartbeat_interval * 2 + 1
+                    )
                 )
 
                 frame = receive_frame(
@@ -1573,6 +1605,9 @@ exit
             clients = self.get_clients()
 
             for client in clients:
+
+                if client.transfer_active.is_set():
+                    continue
 
                 inactive = (
                     current -
@@ -1913,31 +1948,52 @@ exit
             time.time()
         )
 
-        raw_socket = socket.socket(
-            socket.AF_INET,
-            socket.SOCK_STREAM
-        )
-
-        raw_socket.setsockopt(
-            socket.SOL_SOCKET,
-            socket.SO_REUSEADDR,
-            1
-        )
-
-        raw_socket.settimeout(
-            1
-        )
-
-        raw_socket.bind(
-            (
+        if self.args.udp:
+            configuration = create_server_configuration(
                 self.host,
-                self.port
+                self.tls,
+                self.cert,
+                self.key,
+                max(
+                    self.timeout,
+                    self.args.heartbeat_timeout * 2
+                )
             )
-        )
 
-        raw_socket.listen(
-            self.backlog
-        )
+            raw_socket = QuicServer(
+                self.host,
+                self.port,
+                configuration,
+                self.timeout,
+                self.max_clients,
+            )
+            raw_socket.start()
+        else:
+            raw_socket = socket.socket(
+                socket.AF_INET,
+                socket.SOCK_STREAM
+            )
+
+            raw_socket.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_REUSEADDR,
+                1
+            )
+
+            raw_socket.settimeout(
+                1
+            )
+
+            raw_socket.bind(
+                (
+                    self.host,
+                    self.port
+                )
+            )
+
+            raw_socket.listen(
+                self.backlog
+            )
 
         self.server_socket = (
             raw_socket
@@ -1988,7 +2044,7 @@ exit
 
         print(
             f"TLS: "
-            f"{'ON' if self.tls else 'OFF'}"
+            f"{'ON (QUIC TLS 1.3)' if self.args.udp else ('ON' if self.tls else 'OFF')}"
         )
 
         print(
@@ -2028,9 +2084,13 @@ exit
 
                 try:
 
-                    connection, address = (
-                        raw_socket.accept()
-                    )
+                    if self.args.udp:
+                        connection = raw_socket.accept()
+                        address = connection.getpeername()
+                    else:
+                        connection, address = (
+                            raw_socket.accept()
+                        )
 
                 except socket.timeout:
 
@@ -2069,30 +2129,31 @@ exit
                 # TLS
                 # --------------------------------------------
 
-                try:
-
-                    connection = (
-                        self.wrap_tls(
-                            connection
-                        )
-                    )
-
-                except Exception as e:
-
-                    self.logger.error(
-                        "TLS handshake failed "
-                        "for %s: %s",
-                        address,
-                        e
-                    )
-
+                if not self.args.udp:
                     try:
-                        connection.close()
 
-                    except OSError:
-                        pass
+                        connection = (
+                            self.wrap_tls(
+                                connection
+                            )
+                        )
 
-                    continue
+                    except Exception as e:
+
+                        self.logger.error(
+                            "TLS handshake failed "
+                            "for %s: %s",
+                            address,
+                            e
+                        )
+
+                        try:
+                            connection.close()
+
+                        except OSError:
+                            pass
+
+                        continue
 
                 # --------------------------------------------
                 # Client ID
@@ -2264,11 +2325,37 @@ class NetCatClient:
 
         self.heartbeat_thread = None
 
+        self.response_queue = queue.Queue()
+
+        self.expected_response_types = set()
+
+        self.response_lock = threading.Lock()
+
+        self.download_active = threading.Event()
+
+        self.file_transfer_active = threading.Event()
+
     # ========================================================
     # Socket Creation
     # ========================================================
 
     def create_socket(self):
+
+        if self.args.udp:
+            configuration = create_client_configuration(
+                self.ca_file,
+                max(
+                    self.timeout,
+                    self.args.heartbeat_timeout * 2
+                )
+            )
+            connection = QuicClientConnection(
+                self.host,
+                self.port,
+                configuration,
+                self.timeout,
+            )
+            return connection.stream
 
         sock = socket.create_connection(
             (
@@ -2356,6 +2443,12 @@ class NetCatClient:
             )
         )
 
+        if self.args.udp:
+            print(
+                "Transport: QUIC over UDP "
+                "(reliable, TLS 1.3)"
+            )
+
         print(
             f"Client ID: "
             f"{self.client_id}"
@@ -2370,6 +2463,12 @@ class NetCatClient:
             f"TLS: "
             f"{welcome.get('tls', False)}"
         )
+
+        if self.args.udp and not self.ca_file:
+            print(
+                "Warning: server identity is not verified; "
+                "use --ca-file outside a lab."
+            )
 
         print()
 
@@ -2616,6 +2715,11 @@ class NetCatClient:
             path
         )
 
+        self.file_transfer_active.set()
+        self._expect_response(
+            {"upload_result", "error"}
+        )
+
         try:
 
             # ------------------------------------------------
@@ -2679,9 +2783,8 @@ class NetCatClient:
             # Result
             # ------------------------------------------------
 
-            result = receive_frame(
-                self.sock,
-                self.max_size
+            result = self._wait_for_response(
+                {"upload_result", "error"}
             )
 
             if (
@@ -2738,6 +2841,10 @@ class NetCatClient:
 
             self.connected = False
 
+        finally:
+            self.file_transfer_active.clear()
+            self._expect_response(set())
+
     # ========================================================
     # Download
     # ========================================================
@@ -2765,6 +2872,12 @@ class NetCatClient:
                 filename
             )
 
+            self.file_transfer_active.set()
+            self.download_active.set()
+            self._expect_response(
+                {"download_start", "error"}
+            )
+
             send_frame(
                 self.sock,
                 {
@@ -2781,9 +2894,8 @@ class NetCatClient:
             # Metadata
             # ------------------------------------------------
 
-            metadata = receive_frame(
-                self.sock,
-                self.max_size
+            metadata = self._wait_for_response(
+                {"download_start", "error"}
             )
 
             if (
@@ -2946,6 +3058,11 @@ class NetCatClient:
 
             self.connected = False
 
+        finally:
+            self.download_active.clear()
+            self.file_transfer_active.clear()
+            self._expect_response(set())
+
     # ========================================================
     # Display Response
     # ========================================================
@@ -3096,6 +3213,24 @@ class NetCatClient:
     # Receive Loop
     # ========================================================
 
+    def _expect_response(self, response_types):
+        with self.response_lock:
+            self.expected_response_types = set(response_types)
+
+    def _wait_for_response(self, response_types):
+        while self.running and self.connected:
+            try:
+                frame = self.response_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            if frame.get("type") in response_types:
+                return frame
+
+        raise ConnectionError(
+            "Connection closed while waiting for a server response"
+        )
+
     def receive_loop(self):
 
         while self.running:
@@ -3150,6 +3285,14 @@ class NetCatClient:
                         time.time()
                     )
 
+                    with self.response_lock:
+                        expects_pong = (
+                            "pong" in self.expected_response_types
+                        )
+
+                    if expects_pong:
+                        self.response_queue.put(frame)
+
                 # ------------------------------------------------
                 # Server Message
                 # ------------------------------------------------
@@ -3187,18 +3330,25 @@ class NetCatClient:
 
                 else:
 
-                    # This is normally handled
-                    # by command methods.
-                    #
-                    # We only display asynchronous
-                    # messages here.
-
-                    if frame_type not in {
+                    if frame_type in {
                         "response",
                         "error",
                         "upload_result",
-                        "download_start"
+                        "download_start",
                     }:
+                        self.response_queue.put(frame)
+
+                        if (
+                            frame_type == "download_start"
+                            and self.download_active.is_set()
+                        ):
+                            while (
+                                self.download_active.is_set()
+                                and self.running
+                            ):
+                                time.sleep(0.01)
+
+                    else:
 
                         self.display_response(
                             frame
@@ -3251,6 +3401,9 @@ class NetCatClient:
 
             if not self.connected:
 
+                continue
+
+            if self.file_transfer_active.is_set():
                 continue
 
             try:
@@ -3397,6 +3550,12 @@ class NetCatClient:
 
         try:
 
+            expected_responses = {"response", "error"}
+            if command.strip().lower() == "ping":
+                expected_responses.add("pong")
+
+            self._expect_response(expected_responses)
+
             send_frame(
                 self.sock,
                 {
@@ -3409,9 +3568,8 @@ class NetCatClient:
                 self.max_size
             )
 
-            response = receive_frame(
-                self.sock,
-                self.max_size
+            response = self._wait_for_response(
+                expected_responses
             )
 
             self.display_response(
@@ -3433,6 +3591,9 @@ class NetCatClient:
             )
 
             self.connected = False
+
+        finally:
+            self._expect_response(set())
 
     # ========================================================
     # Client Help
@@ -3685,6 +3846,8 @@ class NetCatClient:
         if not self.running:
 
             return
+
+        self.sock.settimeout(None)
 
         # ----------------------------------------------------
         # Receive Thread
@@ -3939,6 +4102,41 @@ def run_self_tests():
         failed += 1
 
     # --------------------------------------------------------
+    # Test 6 - QUIC TLS Configuration
+    # --------------------------------------------------------
+
+    try:
+        server_configuration = create_server_configuration(
+            "localhost",
+            False,
+            "",
+            "",
+            60,
+        )
+        client_configuration = create_client_configuration(
+            None,
+            60,
+        )
+
+        if (
+            server_configuration.certificate is not None
+            and server_configuration.private_key is not None
+            and server_configuration.alpn_protocols == ["netcat-v3"]
+            and client_configuration.verify_mode == ssl.CERT_NONE
+        ):
+            print("[PASS] QUIC TLS configuration")
+            passed += 1
+        else:
+            print("[FAIL] QUIC TLS configuration")
+            failed += 1
+
+    except Exception as e:
+        print(
+            f"[FAIL] QUIC TLS configuration: {e}"
+        )
+        failed += 1
+
+    # --------------------------------------------------------
     # Result
     # --------------------------------------------------------
 
@@ -3969,7 +4167,7 @@ def create_parser():
         prog="netcat.py",
         description=(
             "NetCat V3 - "
-            "Educational TCP Client/Server Tool"
+            "Educational TCP/QUIC Client/Server Tool"
         ),
         formatter_class=(
             argparse.ArgumentDefaultsHelpFormatter
@@ -4000,7 +4198,7 @@ def create_parser():
         "-l",
         "--listen",
         action="store_true",
-        help="Run as TCP server"
+        help="Run as a server (TCP by default; QUIC over UDP with --udp)"
     )
 
     parser.add_argument(
@@ -4009,6 +4207,12 @@ def create_parser():
         help=(
             "Enable interactive server console"
         )
+    )
+
+    parser.add_argument(
+        "--udp",
+        action="store_true",
+        help="Use reliable, encrypted QUIC streams over UDP instead of TCP"
     )
 
     # ========================================================
@@ -4027,7 +4231,7 @@ def create_parser():
         "--port",
         type=int,
         default=DEFAULT_PORT,
-        help="TCP port"
+        help="TCP or QUIC/UDP server/listen port"
     )
 
     parser.add_argument(
@@ -4128,7 +4332,7 @@ def create_parser():
     parser.add_argument(
         "--tls",
         action="store_true",
-        help="Enable TLS encryption"
+        help="Enable TCP TLS (QUIC mode always uses TLS 1.3)"
     )
 
     parser.add_argument(
@@ -4147,8 +4351,7 @@ def create_parser():
         "--ca-file",
         default=None,
         help=(
-            "CA certificate for client "
-            "certificate verification"
+            "CA certificate used to verify the server"
         )
     )
 
@@ -4420,7 +4623,7 @@ def print_banner(
 
     print(
         color(
-            "║       TCP Client / Server Tool           ║",
+            "║     TCP / QUIC Client / Server Tool      ║",
             Colors.CYAN,
             color_enabled
         )
@@ -4492,6 +4695,11 @@ Run:
 Self test:
 
     python netcat.py --self-test
+
+QUIC server and client over UDP:
+
+    python netcat.py -l --udp -t 0.0.0.0 -p 5555
+    python netcat.py --udp -t 127.0.0.1 -p 5555
 """
     )
 
@@ -4646,4 +4854,3 @@ if __name__ == "__main__":
     sys.exit(
         main()
     )
-

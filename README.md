@@ -1,8 +1,8 @@
 # NetCat V3
 
-An educational, multi-client **TCP client/server tool** written in pure Python (standard library only). It supports an interactive server console, a JSON-framed protocol, authentication, TLS, integrity-checked file transfer, heartbeats, auto-reconnect, rate limiting, and more.
+An educational **TCP client/server tool** with a reliable, encrypted QUIC mode over UDP. Both transports support the same JSON-framed protocol, authentication, integrity-checked file transfer, heartbeats, rate limiting, and interactive commands.
 
-> **Version:** 3.0.0 · **Python:** 3.9+ recommended · **Dependencies:** none
+> **Version:** 3.0.0 · **Python:** 3.9+ recommended · **UDP dependencies:** `aioquic`, `cryptography`
 
 ---
 
@@ -24,7 +24,8 @@ An educational, multi-client **TCP client/server tool** written in pure Python (
 ## Features
 
 ### Core
-- **Dual mode** – run as a TCP **server** (`-l`) or **client** from the same script.
+- **TCP and QUIC modes** – run as a TCP server (`-l`) or client by default, or select QUIC streams over UDP with `--udp`.
+- **Shared features** – TCP and QUIC use the same client/server protocol, so authentication, file transfer, heartbeats, reconnect, rate limiting, and interactive commands work in either mode.
 - **Multi-client server** – each client is handled in its own thread, with a configurable cap (`--max-clients`) and listen backlog (`--backlog`).
 - **Per-client tracking** – client ID, address, connection time, last activity, username, and auth state.
 - **Graceful shutdown** – `Ctrl+C` stops the server/client cleanly and closes all sockets.
@@ -76,7 +77,13 @@ cd NetCat
 python3 netcat.py --help
 ```
 
-No `pip install` needed — it only uses the Python standard library.
+Install the QUIC dependency with:
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+TCP mode itself uses only the Python standard library; `aioquic` is used by `--udp`.
 
 ---
 
@@ -146,6 +153,18 @@ python3 netcat.py -l -p 5555 --rate-limit 1048576 --max-size 52428800 --output r
 python3 netcat.py -l -p 5555 --no-file-transfer
 ```
 
+**QUIC over UDP**
+
+```bash
+# Terminal 1 – QUIC server over UDP
+python3 netcat.py -l --udp -t 0.0.0.0 -p 5555 --interactive
+
+# Terminal 2 – QUIC client over UDP
+python3 netcat.py --udp -t 127.0.0.1 -p 5555
+```
+
+QUIC always uses TLS 1.3. Without `--tls`, the server uses a temporary self-signed certificate and the client does not verify the server identity (lab mode). For certificate verification, configure the server with `--tls --cert server.crt --key server.key` and the client with `--tls --ca-file server.crt`.
+
 ---
 
 ## Command Reference
@@ -182,13 +201,14 @@ python3 netcat.py -l -p 5555 --no-file-transfer
 
 | Option | Default | Description |
 |---|---|---|
-| `-l`, `--listen` | off | Run as TCP server |
+| `-l`, `--listen` | off | Run as server (TCP by default; QUIC over UDP with `--udp`) |
 | `--interactive` | off | Enable interactive server console |
+| `--udp` | off | Use reliable, encrypted QUIC streams over UDP instead of TCP |
 | `-t`, `--host` | `127.0.0.1` | Server / listen host |
-| `-p`, `--port` | `5555` | TCP port (1–65535) |
+| `-p`, `--port` | `5555` | Server/listen port (1–65535) |
 | `--timeout` | `10` | Socket timeout (seconds) |
 | `--backlog` | `20` | TCP listen backlog |
-| `--max-size` | `104857600` (100 MB) | Maximum frame/file size |
+| `--max-size` | `104857600` (100 MB) | Maximum frame and file size |
 | `--chunk-size` | `65536` (64 KB) | File transfer chunk size |
 | `--max-clients` | `20` | Maximum simultaneous clients |
 | `--heartbeat-interval` | `20` | Heartbeat interval (seconds) |
@@ -196,7 +216,7 @@ python3 netcat.py -l -p 5555 --no-file-transfer
 | `--rate-limit` | `0` | Per-client limit in bytes/sec (`0` = unlimited) |
 | `--output` | `uploads` | Directory for transferred files |
 | `--no-file-transfer` | off | Disable upload/download |
-| `--tls` | off | Enable TLS encryption |
+| `--tls` | off | Enable TCP TLS; QUIC mode always uses TLS 1.3 |
 | `--cert` | `server.crt` | TLS certificate (server) |
 | `--key` | `server.key` | TLS private key (server) |
 | `--ca-file` | none | CA certificate used by the client to verify the server |
@@ -214,6 +234,8 @@ python3 netcat.py -l -p 5555 --no-file-transfer
 | `--version` | – | Print version and exit |
 
 > `--verbose` and `--quiet` cannot be used together.
+>
+> QUIC mode (`--udp`) runs over UDP but provides reliable, ordered streams and always uses TLS 1.3. It supports the same NetCat application features as TCP.
 
 ---
 
@@ -229,12 +251,15 @@ Messages use a simple **length-prefixed JSON framing**:
 - Frames larger than `--max-size` or with an invalid size are rejected.
 - Message types include authentication (`auth_required`, `auth`, `auth_result`), file transfer (`upload_start`, `upload_result`, `download`, `download_start`), and the control commands listed above.
 
+With `--udp`, the JSON-framed NetCat protocol runs over a reliable QUIC stream. QUIC supplies retransmission, ordering, congestion control, and TLS 1.3 encryption; `aioquic` implements QUIC over UDP. TCP framing and behavior are unchanged.
+
 ---
 
 ## Security Notes
 
-- **Use `--tls` whenever you use `--auth`.** Without TLS, credentials and files travel in plaintext.
-- If the client uses `--tls` **without** `--ca-file`, it runs in *lab mode*: encryption is on, but the server certificate is **not verified** (vulnerable to man-in-the-middle). Always pass `--ca-file` outside of a lab.
+- **For TCP, use `--tls` whenever you use `--auth`.** Without TLS, credentials and files travel in plaintext. QUIC (`--udp`) always encrypts traffic.
+- For TCP, using `--tls` without `--ca-file` enables encryption but does not verify the server certificate (vulnerable to man-in-the-middle). Always pass `--ca-file` outside of a lab.
+- QUIC (`--udp`) always encrypts traffic with TLS 1.3. Without a server certificate configured using `--tls --cert --key`, the server creates a temporary self-signed certificate; clients without `--ca-file` do not verify the server identity.
 - `--ca-file` is used by the **client** to verify the server. The server does not require client certificates.
 - Passing `--password` on the command line can leak it via shell history and process lists; prefer the interactive prompt on the server.
 - Filename sanitization prevents basic path traversal, but this tool is **not hardened for production or untrusted networks**.
@@ -254,6 +279,7 @@ Runs built-in checks for:
 3. Filename sanitization
 4. JSON protocol framing
 5. Rate limiter
+6. QUIC TLS configuration
 
 ---
 

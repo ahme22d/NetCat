@@ -1,2 +1,4 @@
 # NetCat 
-# No third-party dependencies required when using Python's standard library only.
+# aioquic provides reliable, encrypted QUIC transport over UDP.
+aioquic>=1.2,<1.3
+cryptography>=42
